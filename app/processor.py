@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from redis.asyncio import Redis
@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import queue
+from app.cache import DecisionCache
 from app.config import Settings
 from app.db import SessionLocal
 from app.llm import ROUTES, Decision, LLMClient, PermanentLLMError, TransientLLMError
@@ -23,6 +24,10 @@ class Deps:
     settings: Settings
     redis: Redis
     llm: LLMClient
+    cache: DecisionCache = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.cache = DecisionCache(self.redis, self.settings)
 
 
 async def process_ticket(ticket_id: int, deps: Deps) -> None:
@@ -30,9 +35,14 @@ async def process_ticket(ticket_id: int, deps: Deps) -> None:
         ticket = await _claim(session, ticket_id)
         if ticket is None:
             return
-        decision = await _classify_with_retries(session, ticket, deps)
+        decided_by = "cache"
+        decision = await deps.cache.get(ticket.subject, ticket.body)
         if decision is None:
-            return
+            decision = await _classify_with_retries(session, ticket, deps)
+            if decision is None:
+                return
+            await deps.cache.put(ticket.subject, ticket.body, decision)
+            decided_by = "llm"
 
         # A redelivered job may get here twice; the first classification stands.
         await session.execute(
@@ -43,7 +53,7 @@ async def process_ticket(ticket_id: int, deps: Deps) -> None:
                 summary=decision.summary,
                 confidence=decision.confidence,
                 routed_to=ROUTES[decision.category],
-                decided_by="llm",
+                decided_by=decided_by,
                 prompt_version=deps.settings.prompt_version,
             )
             .on_conflict_do_nothing(index_elements=[Classification.ticket_id])
