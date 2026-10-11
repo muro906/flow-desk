@@ -8,7 +8,8 @@ from sqlalchemy import func, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import queue
+from app import queue, rules
+from app.breaker import CircuitBreaker
 from app.cache import DecisionCache
 from app.config import Settings
 from app.db import SessionLocal
@@ -27,10 +28,12 @@ class Deps:
     redis: Redis
     llm: LLMClient
     cache: DecisionCache = field(init=False)
+    breaker: CircuitBreaker = field(init=False)
     flow: CompiledStateGraph = field(init=False)
 
     def __post_init__(self) -> None:
         self.cache = DecisionCache(self.redis, self.settings)
+        self.breaker = CircuitBreaker(self.redis, self.settings)
         self.flow = build_flow(self.llm, self.settings)
 
 
@@ -72,6 +75,11 @@ async def _triage(
 
     settings = deps.settings
     while True:
+        if await deps.breaker.is_open():
+            # The provider is down: route by rules instead of spending attempts on it.
+            fallback = rules.triage(ticket.subject, ticket.body)
+            return await deps.flow.ainvoke(ticket_input | fallback.model_dump()), "rules"
+
         ticket.attempts += 1
         await session.commit()
         try:
@@ -81,6 +89,7 @@ async def _triage(
             await _dead_letter(session, ticket, str(exc))
             return None
         except TransientLLMError as exc:
+            await deps.breaker.record_failure()
             if ticket.attempts >= settings.max_attempts:
                 await _dead_letter(session, ticket, str(exc))
                 return None
@@ -92,6 +101,7 @@ async def _triage(
                 backoff(ticket.attempts, settings.retry_base_delay, settings.retry_max_delay)
             )
         else:
+            await deps.breaker.record_success()
             decision = Decision(**{k: result[k] for k in ("category", "summary", "confidence")})
             await deps.cache.put(ticket.subject, ticket.body, decision)
             return result, "llm"

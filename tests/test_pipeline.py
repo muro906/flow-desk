@@ -138,6 +138,29 @@ async def test_cache_hit_skips_llm_until_prompt_version_changes(
     assert decided == ["llm", "cache", "llm"]
 
 
+async def test_open_breaker_falls_back_to_rules(
+    client, make_worker, session_factory, settings, monkeypatch
+):
+    """Once failures trip the shared breaker, tickets route by rules into human review."""
+    monkeypatch.setattr(settings, "breaker_threshold", 2)
+    llm = FakeLLM(errors=[TransientLLMError("503")] * 10)
+    ticket_id = (await post_ticket(client)).json()["ticket_id"]
+
+    await make_worker(llm).process_next(block_seconds=1)
+
+    ticket = (await client.get(f"/tickets/{ticket_id}")).json()
+    assert ticket["attempts"] == 2  # stopped dialling once the breaker opened
+    assert ticket["status"] == "awaiting_review"
+    assert ticket["classification"]["decided_by"] == "rules"
+    assert ticket["classification"]["category"] == "billing"
+    assert ticket["classification"]["confidence"] == 0.0
+
+    # A second worker sees the same open breaker and doesn't call the provider at all.
+    await post_ticket(client, "other", body="The app crashes on login")
+    await make_worker(llm, worker_id="second-worker").process_next(block_seconds=1)
+    assert llm.calls == 2
+
+
 def test_backoff_uses_full_jitter():
     """Delays spread across [0, ceiling] instead of clustering at the ceiling."""
     delays = [backoff(3, base=0.5, cap=30.0) for _ in range(1000)]
