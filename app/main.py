@@ -4,9 +4,12 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
-from sqlalchemy import select
+from redis.exceptions import RedisError
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import queue
@@ -15,6 +18,8 @@ from app.db import get_session
 from app.models import DeadLetter, Ticket, TicketStatus
 from app.processor import replay_dead_letter
 from app.schemas import DeadLetterOut, Queued, TicketIn, TicketOut, WebhookAccepted
+
+RETRY_AFTER_SECONDS = 30
 
 
 @asynccontextmanager
@@ -48,10 +53,20 @@ def verify_secret(x_webhook_secret: Annotated[str, Header()]) -> None:
     status_code=202,
     tags=["webhooks"],
     dependencies=[Depends(verify_secret)],
+    responses={503: {"description": "Queue full; retry after the Retry-After header"}},
 )
 async def receive_ticket(
     payload: TicketIn, session: Session, redis: RedisDep, response: Response
 ) -> WebhookAccepted:
+    # Shed load rather than queue without bound: senders retry on 503, so the backlog
+    # waits upstream instead of growing Redis memory and every ticket's latency.
+    if await queue.depth(redis) >= get_settings().queue_max_depth:
+        raise HTTPException(
+            status_code=503,
+            detail="queue full, retry later",
+            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+        )
+
     # ON CONFLICT rather than check-then-insert: two concurrent deliveries of the same
     # ticket would both pass the check; only one can win the unique constraint.
     ticket_id = await session.scalar(
@@ -115,6 +130,16 @@ async def replay(
 @app.get("/healthz", tags=["ops"])
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/readyz", tags=["ops"])
+async def readyz(session: Session, redis: RedisDep) -> JSONResponse:
+    try:
+        await session.execute(text("SELECT 1"))
+        depth = await queue.depth(redis)
+    except (SQLAlchemyError, RedisError, OSError) as exc:
+        return JSONResponse({"status": "unavailable", "error": str(exc)}, status_code=503)
+    return JSONResponse({"status": "ready", "queue_depth": depth})
 
 
 def _accepted(

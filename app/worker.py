@@ -51,9 +51,23 @@ class Worker:
     async def run(self) -> None:
         await queue.heartbeat(self.deps.redis, self.id)
         maintenance = asyncio.create_task(self._maintain())
+        # Claim only when a slot is free, so a busy worker leaves jobs in the shared
+        # ready list for idle workers instead of hoarding them.
+        slots = asyncio.Semaphore(self.deps.settings.worker_concurrency)
+        in_flight: set[asyncio.Task] = set()
         log.info("worker %s started", self.id)
         while not self._stopping.is_set():
-            await self.process_next()
+            await slots.acquire()
+            ticket_id = await queue.claim(self.deps.redis, self.id)
+            if ticket_id is None:
+                slots.release()
+                continue
+            task = asyncio.create_task(self._handle(ticket_id))
+            in_flight.add(task)
+            task.add_done_callback(lambda t: (in_flight.discard(t), slots.release()))
+        # Finish claimed work before exiting; anything cut off by a hard kill stays in
+        # the processing list for the reaper.
+        await asyncio.gather(*in_flight)
         maintenance.cancel()
         log.info("worker %s stopped", self.id)
 
