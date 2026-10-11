@@ -13,6 +13,7 @@ READY = "flowdesk:ready"
 PROCESSING = "flowdesk:processing:"
 HEARTBEAT = "flowdesk:heartbeat:"
 HEARTBEAT_TTL = 30
+BLOCK_SECONDS = 5
 
 
 async def enqueue(redis: Redis, ticket_id: int) -> None:
@@ -23,7 +24,7 @@ async def depth(redis: Redis) -> int:
     return await redis.llen(READY)
 
 
-async def claim(redis: Redis, worker_id: str, block_seconds: float) -> int | None:
+async def claim(redis: Redis, worker_id: str, block_seconds: float = BLOCK_SECONDS) -> int | None:
     # Not BRPOP: that removes the job the moment it is taken, so a worker killed
     # mid-job would lose the ticket without a trace.
     raw = await redis.blmove(READY, PROCESSING + worker_id, block_seconds, "RIGHT", "LEFT")

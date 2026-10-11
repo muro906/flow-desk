@@ -1,5 +1,6 @@
 x-app: &app
   build: .
+  restart: unless-stopped
   env_file: .env
   environment:
     # Inside the Compose network the hosts are service names, not localhost.

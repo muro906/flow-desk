@@ -12,11 +12,24 @@ class TicketIn(BaseModel):
     source: str | None = Field(default=None, max_length=64)
 
 
-class WebhookAccepted(BaseModel):
+class Queued(BaseModel):
     ticket_id: int
     status: TicketStatus
     location: str
+
+
+class WebhookAccepted(Queued):
     duplicate: bool
+
+
+class DeadLetterOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    ticket_id: int
+    attempts: int
+    error: str
+    created_at: datetime
 
 
 class ClassificationOut(BaseModel):

@@ -12,8 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import queue
 from app.config import get_settings
 from app.db import get_session
-from app.models import Ticket, TicketStatus
-from app.schemas import TicketIn, TicketOut, WebhookAccepted
+from app.models import DeadLetter, Ticket, TicketStatus
+from app.processor import replay_dead_letter
+from app.schemas import DeadLetterOut, Queued, TicketIn, TicketOut, WebhookAccepted
 
 
 @asynccontextmanager
@@ -87,6 +88,28 @@ async def list_tickets(
     if status:
         query = query.where(Ticket.status == status)
     return list(await session.scalars(query))
+
+
+@app.get("/dead-letters", tags=["dead letters"])
+async def list_dead_letters(
+    session: Session,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[DeadLetterOut]:
+    query = select(DeadLetter).order_by(DeadLetter.created_at.desc()).limit(limit).offset(offset)
+    return list(await session.scalars(query))
+
+
+@app.post("/dead-letters/{dead_letter_id}/replay", status_code=202, tags=["dead letters"])
+async def replay(
+    dead_letter_id: int, session: Session, redis: RedisDep, response: Response
+) -> Queued:
+    try:
+        ticket_id = await replay_dead_letter(session, redis, dead_letter_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="dead letter not found") from None
+    response.headers["Location"] = f"/tickets/{ticket_id}"
+    return Queued(ticket_id=ticket_id, status=TicketStatus.queued, location=f"/tickets/{ticket_id}")
 
 
 @app.get("/healthz", tags=["ops"])
