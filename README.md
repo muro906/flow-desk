@@ -95,7 +95,9 @@ the breaker or reopens it.
 **Covering the dual write.** The webhook commits to Postgres and then pushes to Redis. If the
 API dies between those two steps, the ticket exists but no job does. A sweeper (one worker at a
 time, via a Redis lock) re-enqueues tickets left untouched in `queued` or `processing` for 15
-minutes. *Gave up:* a transactional outbox would close the gap immediately, but at the cost of
+minutes. The same sweep rebuilds the queue from Postgres if Redis ever loses data, although
+Redis runs with append-only persistence, so a plain restart keeps its jobs. *Gave up:* a
+transactional outbox would close the gap immediately, but at the cost of
 more machinery than the risk justifies here.
 
 ## What's not done
