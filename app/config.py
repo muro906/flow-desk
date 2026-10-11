@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     webhook_secret: str
     llm_api_key: str
 
-    llm_model: str = "gemini-3.8-flash"
+    llm_model: str = "gemini-3.5-flash"
     prompt_version: str = "v1"
     confidence_threshold: float = 0.70
     max_attempts: int = 5

@@ -42,7 +42,7 @@ Everything is set with environment variables, normally in `.env`.
 | `REDIS_URL` | required | `redis://…` (Compose sets this for its containers) |
 | `WEBHOOK_SECRET` | required | Shared secret the webhook expects in `X-Webhook-Secret` |
 | `LLM_API_KEY` | required | Gemini API key; if blank, tickets are dead-lettered |
-| `LLM_MODEL` | `gemini-3.8-flash` | Gemini model used to classify and summarise; e.g. `gemini-2.5-pro` for harder tickets at higher latency and cost. Pin a version rather than a `-latest` alias, so the model can't change underneath the cache. |
+| `LLM_MODEL` | `gemini-3.5-flash` | Gemini model used to classify and summarise; a Pro model handles harder tickets at higher latency and cost. Pin a version rather than a `-latest` alias, so the model can't change underneath the cache. |
 | `PROMPT_VERSION` | `v1` | Part of the cache key; bump it whenever the prompts change |
 | `CONFIDENCE_THRESHOLD` | `0.70` | Below this, tickets go to human review |
 | `MAX_ATTEMPTS` | `5` | LLM attempts per ticket before it is dead-lettered |
