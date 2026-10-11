@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 from redis.asyncio import Redis
 from sqlalchemy import update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -28,8 +29,10 @@ async def process_ticket(ticket_id: int, deps: Deps) -> None:
         ticket.attempts += 1
         await session.commit()
         decision = await deps.llm.classify(ticket.subject, ticket.body)
-        session.add(
-            Classification(
+        # A redelivered job may get here twice; the first classification stands.
+        await session.execute(
+            insert(Classification)
+            .values(
                 ticket_id=ticket.id,
                 category=decision.category,
                 summary=decision.summary,
@@ -38,6 +41,7 @@ async def process_ticket(ticket_id: int, deps: Deps) -> None:
                 decided_by="llm",
                 prompt_version=deps.settings.prompt_version,
             )
+            .on_conflict_do_nothing(index_elements=[Classification.ticket_id])
         )
         await _finish(
             session,

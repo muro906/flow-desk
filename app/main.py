@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import queue
@@ -50,12 +51,24 @@ def verify_secret(x_webhook_secret: Annotated[str, Header()]) -> None:
 async def receive_ticket(
     payload: TicketIn, session: Session, redis: RedisDep, response: Response
 ) -> WebhookAccepted:
-    ticket = Ticket(**payload.model_dump(), status=TicketStatus.queued)
-    session.add(ticket)
+    # ON CONFLICT rather than check-then-insert: two concurrent deliveries of the same
+    # ticket would both pass the check; only one can win the unique constraint.
+    ticket_id = await session.scalar(
+        insert(Ticket)
+        .values(**payload.model_dump(), status=TicketStatus.queued)
+        .on_conflict_do_nothing(index_elements=[Ticket.external_id])
+        .returning(Ticket.id)
+    )
+    if ticket_id is None:
+        existing = await session.scalar(
+            select(Ticket).where(Ticket.external_id == payload.external_id)
+        )
+        return _accepted(response, existing.id, existing.status, duplicate=True)
+
     # Commit before enqueueing: a fast worker must never pop an id it can't see yet.
     await session.commit()
-    await queue.enqueue(redis, ticket.id)
-    return _accepted(response, ticket.id, ticket.status, duplicate=False)
+    await queue.enqueue(redis, ticket_id)
+    return _accepted(response, ticket_id, TicketStatus.queued, duplicate=False)
 
 
 @app.get("/tickets/{ticket_id}", tags=["tickets"])
