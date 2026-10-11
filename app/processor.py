@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from langgraph.graph.state import CompiledStateGraph
 from redis.asyncio import Redis
 from sqlalchemy import func, update
 from sqlalchemy.dialects.postgresql import insert
@@ -11,7 +12,8 @@ from app import queue
 from app.cache import DecisionCache
 from app.config import Settings
 from app.db import SessionLocal
-from app.llm import ROUTES, Decision, LLMClient, PermanentLLMError, TransientLLMError
+from app.flow import TriageState, build_flow
+from app.llm import Decision, LLMClient, PermanentLLMError, TransientLLMError
 from app.models import Classification, DeadLetter, Ticket, TicketStatus
 from app.retry import backoff
 
@@ -25,9 +27,11 @@ class Deps:
     redis: Redis
     llm: LLMClient
     cache: DecisionCache = field(init=False)
+    flow: CompiledStateGraph = field(init=False)
 
     def __post_init__(self) -> None:
         self.cache = DecisionCache(self.redis, self.settings)
+        self.flow = build_flow(self.llm, self.settings)
 
 
 async def process_ticket(ticket_id: int, deps: Deps) -> None:
@@ -35,49 +39,43 @@ async def process_ticket(ticket_id: int, deps: Deps) -> None:
         ticket = await _claim(session, ticket_id)
         if ticket is None:
             return
-        decided_by = "cache"
-        decision = await deps.cache.get(ticket.subject, ticket.body)
-        if decision is None:
-            decision = await _classify_with_retries(session, ticket, deps)
-            if decision is None:
-                return
-            await deps.cache.put(ticket.subject, ticket.body, decision)
-            decided_by = "llm"
+        outcome = await _triage(session, ticket, deps)
+        if outcome is None:
+            return
+        result, decided_by = outcome
 
         # A redelivered job may get here twice; the first classification stands.
         await session.execute(
             insert(Classification)
             .values(
                 ticket_id=ticket.id,
-                category=decision.category,
-                summary=decision.summary,
-                confidence=decision.confidence,
-                routed_to=ROUTES[decision.category],
+                category=result["category"],
+                summary=result["summary"],
+                confidence=result["confidence"],
+                routed_to=result["routed_to"],
                 decided_by=decided_by,
                 prompt_version=deps.settings.prompt_version,
             )
             .on_conflict_do_nothing(index_elements=[Classification.ticket_id])
         )
-        await _finish(
-            session,
-            ticket.id,
-            TicketStatus.routed
-            if decision.confidence >= deps.settings.confidence_threshold
-            else TicketStatus.awaiting_review,
-            last_error=None,
-        )
+        status = TicketStatus.awaiting_review if result["needs_review"] else TicketStatus.routed
+        await _finish(session, ticket.id, status, last_error=None)
 
 
-async def _classify_with_retries(
+async def _triage(
     session: AsyncSession, ticket: Ticket, deps: Deps
-) -> Decision | None:
-    """Return the decision, or None once the ticket has been dead-lettered."""
+) -> tuple[TriageState, str] | None:
+    """Run the triage flow; return (result, decided_by), or None once dead-lettered."""
+    ticket_input: TriageState = {"subject": ticket.subject, "body": ticket.body}
+    if cached := await deps.cache.get(ticket.subject, ticket.body):
+        return await deps.flow.ainvoke(ticket_input | cached.model_dump()), "cache"
+
     settings = deps.settings
     while True:
         ticket.attempts += 1
         await session.commit()
         try:
-            return await deps.llm.classify(ticket.subject, ticket.body)
+            result = await deps.flow.ainvoke(ticket_input)
         except PermanentLLMError as exc:
             # Retrying would spend the whole budget on a request that cannot succeed.
             await _dead_letter(session, ticket, str(exc))
@@ -93,6 +91,10 @@ async def _classify_with_retries(
             await asyncio.sleep(
                 backoff(ticket.attempts, settings.retry_base_delay, settings.retry_max_delay)
             )
+        else:
+            decision = Decision(**{k: result[k] for k in ("category", "summary", "confidence")})
+            await deps.cache.put(ticket.subject, ticket.body, decision)
+            return result, "llm"
 
 
 async def _dead_letter(session: AsyncSession, ticket: Ticket, error: str) -> None:

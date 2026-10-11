@@ -64,6 +64,24 @@ async def test_exhausted_retries_dead_letter(client, make_worker, session_factor
     assert await count(session_factory, DeadLetter) == 0
 
 
+async def test_low_confidence_routes_to_review(client, make_worker):
+    """Below the threshold the flow escalates; a reviewer's approval routes the ticket."""
+    ticket_id = (await post_ticket(client)).json()["ticket_id"]
+    await make_worker(FakeLLM(confidence=0.4)).process_next(block_seconds=1)
+
+    ticket = (await client.get(f"/tickets/{ticket_id}")).json()
+    assert ticket["status"] == "awaiting_review"
+    assert ticket["classification"]["routed_to"] == "billing-team"  # suggestion for the reviewer
+
+    approved = await client.post(
+        f"/tickets/{ticket_id}/approve", json={"routed_to": "customer-success"}
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "routed"
+    assert approved.json()["classification"]["routed_to"] == "customer-success"
+    assert (await client.post(f"/tickets/{ticket_id}/reject")).status_code == 409
+
+
 async def test_permanent_error_is_not_retried(client, make_worker, session_factory):
     """A 400 would fail identically every time, so it is dead-lettered on the first attempt."""
     llm = FakeLLM(errors=[PermanentLLMError("400: bad request")])

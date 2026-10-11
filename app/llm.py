@@ -5,7 +5,20 @@ from pydantic import BaseModel, Field
 
 from app.config import get_settings
 
-SYSTEM_PROMPT = """You triage customer support tickets.
+Category = Literal["billing", "technical", "account", "feature_request", "complaint", "other"]
+
+# Routing is a fixed table rather than a model output: the model can be wrong about a
+# category, but it can never be talked into sending a ticket to a queue that doesn't exist.
+ROUTES: dict[str, str] = {
+    "billing": "billing-team",
+    "technical": "engineering-support",
+    "account": "account-team",
+    "feature_request": "product-team",
+    "complaint": "customer-success",
+    "other": "general-support",
+}
+
+CLASSIFY_PROMPT = """You triage customer support tickets.
 
 Pick exactly one category:
 - billing: charges, invoices, refunds, payment methods
@@ -15,24 +28,26 @@ Pick exactly one category:
 - complaint: dissatisfaction with service or staff, no specific fix requested
 - other: none of the above
 
-Write a one or two sentence summary a support agent can act on.
 Give your confidence (0.0-1.0) that the category is correct. Be calibrated:
 use a low value when the ticket is vague, mixes several issues, or is not a support request."""
 
-# Routing is a fixed table rather than a model output: the model can be wrong about a
-# category, but it can never be talked into sending a ticket to a queue that doesn't exist.
-ROUTES = {
-    "billing": "billing-team",
-    "technical": "engineering-support",
-    "account": "account-team",
-    "feature_request": "product-team",
-    "complaint": "customer-success",
-    "other": "general-support",
-}
+SUMMARY_PROMPT = """Summarise this customer support ticket in one or two sentences for the
+agent who will handle it: what happened, and what the customer wants."""
+
+
+class Classified(BaseModel):
+    category: Category
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class Summary(BaseModel):
+    summary: str
 
 
 class Decision(BaseModel):
-    category: Literal["billing", "technical", "account", "feature_request", "complaint", "other"]
+    """A complete triage outcome, as cached and as produced by the rules fallback."""
+
+    category: Category
     summary: str
     confidence: float = Field(ge=0.0, le=1.0)
 
@@ -54,18 +69,25 @@ class LLMClient:
         # policies would multiply attempts and hide them from the attempts count.
         self._client = anthropic.AsyncAnthropic(api_key=self._api_key, max_retries=0, timeout=60)
 
-    async def classify(self, subject: str | None, body: str) -> Decision:
+    async def classify(self, subject: str | None, body: str) -> Classified:
+        return await self._parse(CLASSIFY_PROMPT, subject, body, Classified)
+
+    async def summarise(self, subject: str | None, body: str) -> str:
+        return (await self._parse(SUMMARY_PROMPT, subject, body, Summary)).summary
+
+    async def _parse[T: BaseModel](
+        self, system: str, subject: str | None, body: str, schema: type[T]
+    ) -> T:
         if not self._api_key:
             raise PermanentLLMError("LLM_API_KEY is not set")
-        ticket = f"Subject: {subject or '(none)'}\n\n{body}"
         try:
             response = await self._client.messages.parse(
                 model=self._model,
                 max_tokens=2048,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": ticket}],
+                system=system,
+                messages=[{"role": "user", "content": f"Subject: {subject or '(none)'}\n\n{body}"}],
                 output_config={"effort": "low"},
-                output_format=Decision,
+                output_format=schema,
             )
         except anthropic.APIConnectionError as exc:  # includes timeouts
             raise TransientLLMError(f"connection: {exc}") from exc

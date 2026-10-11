@@ -1,7 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.llm import ROUTES
 from app.models import TicketStatus
 
 
@@ -10,6 +11,19 @@ class TicketIn(BaseModel):
     body: str = Field(min_length=1)
     subject: str | None = Field(default=None, max_length=512)
     source: str | None = Field(default=None, max_length=64)
+
+
+class Approval(BaseModel):
+    routed_to: str | None = Field(
+        default=None, description="Override the suggested team", examples=["billing-team"]
+    )
+
+    @field_validator("routed_to")
+    @classmethod
+    def known_team(cls, team: str | None) -> str | None:
+        if team is not None and team not in ROUTES.values():
+            raise ValueError(f"unknown team; expected one of {sorted(ROUTES.values())}")
+        return team
 
 
 class Queued(BaseModel):

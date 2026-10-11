@@ -7,7 +7,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,9 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import queue
 from app.config import get_settings
 from app.db import get_session
-from app.models import DeadLetter, Ticket, TicketStatus
+from app.models import Classification, DeadLetter, Ticket, TicketStatus
 from app.processor import replay_dead_letter
-from app.schemas import DeadLetterOut, Queued, TicketIn, TicketOut, WebhookAccepted
+from app.schemas import Approval, DeadLetterOut, Queued, TicketIn, TicketOut, WebhookAccepted
 
 RETRY_AFTER_SECONDS = 30
 
@@ -105,6 +105,18 @@ async def list_tickets(
     return list(await session.scalars(query))
 
 
+@app.post("/tickets/{ticket_id}/approve", tags=["review"])
+async def approve(ticket_id: int, session: Session, approval: Approval | None = None) -> TicketOut:
+    """Accept an escalated ticket, optionally sending it to a different team."""
+    routed_to = approval.routed_to if approval else None
+    return await _resolve(session, ticket_id, TicketStatus.routed, routed_to)
+
+
+@app.post("/tickets/{ticket_id}/reject", tags=["review"])
+async def reject(ticket_id: int, session: Session) -> TicketOut:
+    return await _resolve(session, ticket_id, TicketStatus.rejected)
+
+
 @app.get("/dead-letters", tags=["dead letters"])
 async def list_dead_letters(
     session: Session,
@@ -150,6 +162,30 @@ def _accepted(
     return WebhookAccepted(
         ticket_id=ticket_id, status=status, location=location, duplicate=duplicate
     )
+
+
+async def _resolve(
+    session: AsyncSession, ticket_id: int, status: TicketStatus, routed_to: str | None = None
+) -> Ticket:
+    # The status guard makes the transition atomic: two reviewers acting at once
+    # can't both succeed, and a resolved ticket can't be resolved again.
+    resolved = await session.scalar(
+        update(Ticket)
+        .where(Ticket.id == ticket_id, Ticket.status == TicketStatus.awaiting_review)
+        .values(status=status)
+        .returning(Ticket.id)
+    )
+    if resolved is None:
+        await _load(session, ticket_id)  # 404 if it doesn't exist
+        raise HTTPException(status_code=409, detail="ticket is not awaiting review")
+    if routed_to:
+        await session.execute(
+            update(Classification)
+            .where(Classification.ticket_id == ticket_id)
+            .values(routed_to=routed_to)
+        )
+    await session.commit()
+    return await _load(session, ticket_id)
 
 
 async def _load(session: AsyncSession, ticket_id: int) -> Ticket:

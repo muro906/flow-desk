@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
 from app.db import SessionLocal, engine  # noqa: E402
-from app.llm import Decision  # noqa: E402
+from app.llm import Classified  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Base  # noqa: E402
 from app.processor import Deps  # noqa: E402
@@ -57,11 +57,10 @@ class FakeLLM:
         self.calls += 1
         if self.errors:
             raise self.errors.pop(0)
-        return Decision(
-            category=self.category,
-            summary="Customer was charged twice.",
-            confidence=self.confidence,
-        )
+        return Classified(category=self.category, confidence=self.confidence)
+
+    async def summarise(self, subject, body):
+        return "Customer was charged twice."
 
 
 @pytest.fixture(scope="session", autouse=True)
