@@ -1,6 +1,9 @@
 from typing import Literal
 
-import anthropic
+import httpx
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
@@ -64,10 +67,16 @@ class LLMClient:
     def __init__(self) -> None:
         settings = get_settings()
         self._model = settings.llm_model
-        self._api_key = settings.llm_api_key
-        # SDK retries are off: the worker owns the retry policy, and stacking two
-        # policies would multiply attempts and hide them from the attempts count.
-        self._client = anthropic.AsyncAnthropic(api_key=self._api_key, max_retries=0, timeout=60)
+        # SDK retries are off (one attempt): the worker owns the retry policy, and
+        # stacking two policies would multiply attempts and hide them from the count.
+        http_options = types.HttpOptions(
+            timeout=60_000, retry_options=types.HttpRetryOptions(attempts=1)
+        )
+        self._client = (
+            genai.Client(api_key=settings.llm_api_key, http_options=http_options).aio
+            if settings.llm_api_key
+            else None
+        )
 
     async def classify(self, subject: str | None, body: str) -> Classified:
         return await self._parse(CLASSIFY_PROMPT, subject, body, Classified)
@@ -78,26 +87,30 @@ class LLMClient:
     async def _parse[T: BaseModel](
         self, system: str, subject: str | None, body: str, schema: type[T]
     ) -> T:
-        if not self._api_key:
+        if self._client is None:
             raise PermanentLLMError("LLM_API_KEY is not set")
         try:
-            response = await self._client.messages.parse(
+            response = await self._client.models.generate_content(
                 model=self._model,
-                max_tokens=2048,
-                system=system,
-                messages=[{"role": "user", "content": f"Subject: {subject or '(none)'}\n\n{body}"}],
-                output_config={"effort": "low"},
-                output_format=schema,
+                contents=f"Subject: {subject or '(none)'}\n\n{body}",
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                    thinking_config=types.ThinkingConfig(thinking_level="low"),
+                ),
             )
-        except anthropic.APIConnectionError as exc:  # includes timeouts
-            raise TransientLLMError(f"connection: {exc}") from exc
-        except anthropic.APIStatusError as exc:
-            if exc.status_code in (408, 429) or exc.status_code >= 500:
-                raise TransientLLMError(f"{exc.status_code}: {exc.message}") from exc
-            raise PermanentLLMError(f"{exc.status_code}: {exc.message}") from exc
+        except httpx.TransportError as exc:  # connection failures and timeouts
+            raise TransientLLMError(f"connection: {exc!r}") from exc
+        except genai_errors.APIError as exc:
+            if exc.code in (408, 429) or exc.code >= 500:
+                raise TransientLLMError(f"{exc.code}: {exc.message}") from exc
+            raise PermanentLLMError(f"{exc.code}: {exc.message}") from exc
 
-        if response.stop_reason == "refusal":
-            raise PermanentLLMError("model refused the ticket")
-        if response.parsed_output is None:
-            raise PermanentLLMError(f"unparseable output (stop_reason={response.stop_reason})")
-        return response.parsed_output
+        feedback = response.prompt_feedback
+        if feedback and feedback.block_reason:
+            raise PermanentLLMError(f"prompt blocked: {feedback.block_reason.name}")
+        if not isinstance(response.parsed, schema):
+            reason = response.candidates[0].finish_reason if response.candidates else None
+            raise PermanentLLMError(f"no usable output (finish_reason={reason})")
+        return response.parsed
