@@ -15,7 +15,8 @@ wrong. For why it is built this way, see the [README](../README.md).
 
 ## Setup
 
-You need Docker with Compose, and an Anthropic API key.
+You need Docker with Compose, and a Gemini API key from
+[Google AI Studio](https://aistudio.google.com/apikey).
 
 ```bash
 cp .env.example .env
@@ -40,8 +41,8 @@ Everything is set with environment variables, normally in `.env`.
 | `DATABASE_URL` | required | `postgresql+asyncpg://…` (Compose sets this for its containers) |
 | `REDIS_URL` | required | `redis://…` (Compose sets this for its containers) |
 | `WEBHOOK_SECRET` | required | Shared secret the webhook expects in `X-Webhook-Secret` |
-| `LLM_API_KEY` | required | Anthropic API key; if blank, tickets are dead-lettered |
-| `LLM_MODEL` | `claude-opus-5-5` | Model used to classify and summarise; e.g. `claude-sonnet-5-5` for lower latency and cost |
+| `LLM_API_KEY` | required | Gemini API key; if blank, tickets are dead-lettered |
+| `LLM_MODEL` | `gemini-3.8-flash` | Gemini model used to classify and summarise; e.g. `gemini-2.5-pro` for harder tickets at higher latency and cost. Pin a version rather than a `-latest` alias, so the model can't change underneath the cache. |
 | `PROMPT_VERSION` | `v1` | Part of the cache key; bump it whenever the prompts change |
 | `CONFIDENCE_THRESHOLD` | `0.70` | Below this, tickets go to human review |
 | `MAX_ATTEMPTS` | `5` | LLM attempts per ticket before it is dead-lettered |
@@ -143,7 +144,7 @@ ticket.
 ## Dead letters and replay
 
 A ticket is dead-lettered when every attempt fails with a transient error (timeouts, 429, 5xx),
-or straight away on a permanent error (other 4xx, a refusal, a missing API key). Its status
+or straight away on a permanent error (other 4xx, a blocked prompt, a missing API key). Its status
 becomes `failed`, and a row is added to `dead_letters`.
 
 ```bash
@@ -211,7 +212,7 @@ The code is organised like this:
 | `app/worker.py` | Worker process: claim loop, concurrency limit, maintenance |
 | `app/processor.py` | One ticket: cache, retries, breaker, fallback, persistence |
 | `app/flow.py` | LangGraph triage flow |
-| `app/llm.py` | Anthropic client, prompts, error classification, routing table |
+| `app/llm.py` | Gemini client, prompts, error classification, routing table |
 | `app/cache.py`, `app/breaker.py`, `app/rules.py`, `app/retry.py` | Decision cache, circuit breaker, rules fallback, backoff |
 | `app/models.py`, `migrations/` | Database schema |
 
@@ -221,7 +222,8 @@ The code is organised like this:
 | --- | --- |
 | `docker compose up` fails with "port is already allocated" | Set `POSTGRES_PORT`, `REDIS_PORT` or `API_PORT` in `.env`. |
 | Every ticket ends up `failed` with `LLM_API_KEY is not set` | Set the key in `.env`, run `docker compose up -d worker`, then replay the dead letters. |
-| Errors starting with `401:` or `404:` in dead letters | Wrong API key or an unknown `LLM_MODEL`. These are permanent errors, so they aren't retried. |
+| Errors starting with `400:`, `403:` or `404:` in dead letters | An invalid API key (400 "API key not valid"), a key without access (403) or an unknown `LLM_MODEL` (404). These are permanent errors, so they aren't retried. |
+| `last_error` shows `503: This model is currently experiencing high demand` | Gemini is overloaded. This is transient, so the ticket is retried with backoff; if it persists, the breaker opens and tickets route by rules to review. |
 | Everything lands in review with `decided_by: rules` | The breaker is open because the provider is failing. It retries on its own after `BREAKER_RESET_SECONDS`. |
 | The webhook returns `503` | The queue has reached `QUEUE_MAX_DEPTH`. Add workers, or check that the worker is running. |
 | Tickets stay `queued` | No worker is running: check `docker compose ps` and `docker compose logs worker`. |

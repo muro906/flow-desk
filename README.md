@@ -1,10 +1,10 @@
 # Flowdesk
 
-Flowdesk takes support tickets from a webhook, uses an LLM to categorise, summarise and route
+Flowdesk takes support tickets from a webhook, uses an LLM (Gemini) to categorise, summarise and route
 each one in the background, and sends the ones it isn't sure about to a human for approval.
 
 ```bash
-cp .env.example .env        # then set LLM_API_KEY
+cp .env.example .env        # then set LLM_API_KEY to a Gemini API key
 docker compose up
 ```
 
@@ -62,7 +62,7 @@ concurrency slot for at most `RETRY_MAX_DELAY`. A delayed-retry queue would free
 the cost of another moving part.
 
 **Errors are sorted before they're retried.** Timeouts, 408, 429 and 5xx are transient: retry
-them. Other 4xx responses, refusals and a missing API key are permanent: a 400 will fail the
+them. Other 4xx responses, blocked prompts and a missing API key are permanent: a 400 will fail the
 same way every time, and retrying it burns the whole budget. Those are dead-lettered on the
 first attempt. "Is it worth retrying?" and "how long to wait?" are separate decisions.
 
