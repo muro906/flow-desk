@@ -1,20 +1,38 @@
 import hmac
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import queue
 from app.config import get_settings
 from app.db import get_session
-from app.llm import ROUTES, LLMClient
-from app.models import Classification, Ticket, TicketStatus
-from app.schemas import TicketIn, TicketOut
+from app.models import Ticket, TicketStatus
+from app.schemas import TicketIn, TicketOut, WebhookAccepted
 
-app = FastAPI(title="Flowdesk", description="LLM ticket triage with human review.")
-llm = LLMClient()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    app.state.redis = Redis.from_url(get_settings().redis_url, decode_responses=True)
+    yield
+    await app.state.redis.aclose()
+
+
+app = FastAPI(
+    title="Flowdesk", description="LLM ticket triage with human review.", lifespan=lifespan
+)
+
+
+def get_redis(request: Request) -> Redis:
+    return request.app.state.redis
+
 
 Session = Annotated[AsyncSession, Depends(get_session)]
+RedisDep = Annotated[Redis, Depends(get_redis)]
 
 
 def verify_secret(x_webhook_secret: Annotated[str, Header()]) -> None:
@@ -23,34 +41,21 @@ def verify_secret(x_webhook_secret: Annotated[str, Header()]) -> None:
         raise HTTPException(status_code=401, detail="invalid webhook secret")
 
 
-@app.post("/webhooks/ticket", tags=["webhooks"], dependencies=[Depends(verify_secret)])
-async def receive_ticket(payload: TicketIn, session: Session) -> TicketOut:
-    # Stage 2 (naive): the LLM call happens inside the request, so the caller waits
-    # for the whole round-trip and a slow provider stalls every webhook sender.
-    ticket = Ticket(**payload.model_dump(), status=TicketStatus.processing, attempts=1)
+@app.post(
+    "/webhooks/ticket",
+    status_code=202,
+    tags=["webhooks"],
+    dependencies=[Depends(verify_secret)],
+)
+async def receive_ticket(
+    payload: TicketIn, session: Session, redis: RedisDep, response: Response
+) -> WebhookAccepted:
+    ticket = Ticket(**payload.model_dump(), status=TicketStatus.queued)
     session.add(ticket)
-    await session.flush()
-
-    decision = await llm.classify(ticket.subject, ticket.body)
-    settings = get_settings()
-    session.add(
-        Classification(
-            ticket_id=ticket.id,
-            category=decision.category,
-            summary=decision.summary,
-            confidence=decision.confidence,
-            routed_to=ROUTES[decision.category],
-            decided_by="llm",
-            prompt_version=settings.prompt_version,
-        )
-    )
-    ticket.status = (
-        TicketStatus.routed
-        if decision.confidence >= settings.confidence_threshold
-        else TicketStatus.awaiting_review
-    )
+    # Commit before enqueueing: a fast worker must never pop an id it can't see yet.
     await session.commit()
-    return await _load(session, ticket.id)
+    await queue.enqueue(redis, ticket.id)
+    return _accepted(response, ticket.id, ticket.status, duplicate=False)
 
 
 @app.get("/tickets/{ticket_id}", tags=["tickets"])
@@ -74,6 +79,16 @@ async def list_tickets(
 @app.get("/healthz", tags=["ops"])
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _accepted(
+    response: Response, ticket_id: int, status: TicketStatus, duplicate: bool
+) -> WebhookAccepted:
+    location = f"/tickets/{ticket_id}"
+    response.headers["Location"] = location
+    return WebhookAccepted(
+        ticket_id=ticket_id, status=status, location=location, duplicate=duplicate
+    )
 
 
 async def _load(session: AsyncSession, ticket_id: int) -> Ticket:

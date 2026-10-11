@@ -12,6 +12,13 @@ class TicketIn(BaseModel):
     source: str | None = Field(default=None, max_length=64)
 
 
+class WebhookAccepted(BaseModel):
+    ticket_id: int
+    status: TicketStatus
+    location: str
+    duplicate: bool
+
+
 class ClassificationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

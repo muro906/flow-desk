@@ -1,3 +1,11 @@
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    # Inside the Compose network the hosts are service names, not localhost.
+    DATABASE_URL: postgresql+asyncpg://flowdesk:flowdesk@postgres:5432/flowdesk
+    REDIS_URL: redis://redis:6379/0
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -5,7 +13,7 @@ services:
       POSTGRES_USER: flowdesk
       POSTGRES_PASSWORD: flowdesk
       POSTGRES_DB: flowdesk
-    ports: ["5432:5432"]
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U flowdesk"]
@@ -14,25 +22,31 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports: ["${REDIS_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       retries: 15
 
   api:
-    build: .
-    env_file: .env
-    environment:
-      # Inside the Compose network the hosts are service names, not localhost.
-      DATABASE_URL: postgresql+asyncpg://flowdesk:flowdesk@postgres:5432/flowdesk
-      REDIS_URL: redis://redis:6379/0
+    <<: *app
     # Migrations run before the server starts, so `docker compose up` is the only command needed.
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
-    ports: ["8000:8000"]
+    ports: ["${API_PORT:-8000}:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 3s
+      retries: 20
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+
+  worker:
+    <<: *app
+    command: python -m app.worker
+    # Waits for the API so migrations have run before the first job is claimed.
+    depends_on:
+      api: { condition: service_healthy }
 
 volumes:
   pgdata:
